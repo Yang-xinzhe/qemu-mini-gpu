@@ -52,13 +52,13 @@ static int edu_open(struct inode *inode, struct file *file) {
     edu = container_of(inode->i_cdev, struct edu_device, cdev);
 
     file->private_data = edu;
-    dev_info(&edu->pdev->dev, "open: edu-gpu0\n");
+    // dev_info(&edu->pdev->dev, "open: edu-gpu0\n");
     return 0;
 }
 
 static int edu_release(struct inode *inode, struct file *file){
-    struct edu_device *edu = file->private_data;
-    dev_info(&edu->pdev->dev, "release: edu-gpu0\n");
+    // struct edu_device *edu = file->private_data;
+    // dev_info(&edu->pdev->dev, "release: edu-gpu0\n");
     return 0;
 }
 
