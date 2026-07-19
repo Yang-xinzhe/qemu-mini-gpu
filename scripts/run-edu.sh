@@ -12,4 +12,5 @@ qemu/build/qemu-system-x86_64 \
     -initrd buildroot/build/images/rootfs.cpio.gz \
     -append "console=ttyS0 earlyprintk=serial nokaslr panic=-1" \
     -nographic \
-    -no-reboot
+    -no-reboot \
+    -device edu
