@@ -1,0 +1,17 @@
+.omx/
+
+# Build outputs
+qemu/build/*
+!qemu/build/README.md
+linux/build/*
+!linux/build/.gitignore
+!linux/build/README.md
+buildroot/build/*
+!buildroot/build/README.md
+
+# Deprecated hand-built root filesystem
+rootfs/
+
+# Runtime logs
+logs/*
+!logs/README.md

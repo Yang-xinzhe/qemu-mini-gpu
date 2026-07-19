@@ -1,0 +1,9 @@
+[submodule "qemu/src"]
+	path = qemu/src
+	url = https://gitlab.com/qemu-project/qemu.git
+[submodule "linux/src"]
+	path = linux/src
+	url = https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+[submodule "buildroot/src"]
+	path = buildroot/src
+	url = https://gitlab.com/buildroot.org/buildroot.git
