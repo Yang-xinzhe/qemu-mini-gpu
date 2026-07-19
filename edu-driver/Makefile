@@ -27,7 +27,7 @@ $(USER_TEST): user_test/edu_test.c include/edu_uapi.h
 	@test -x $(TARGET_CC) || \
 		(echo "error: run ./scripts/build-rootfs.sh first"; exit 1)
 	$(TARGET_CC) \
-		-Wall -Wextra -O2 \
+		-Wall -Wextra -O2 -pthread \
 		-I$(CURDIR)/include \
 		-o $@ $<
 

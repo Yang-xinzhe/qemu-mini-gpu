@@ -67,7 +67,7 @@ static long edu_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
     struct edu_reg_io reg;
     long ret = 0;
 
-    dev_info(&edu->pdev->dev, "ioctl cmd=0x%x, arg=0x%lx\n", cmd, arg);
+    dev_dbg(&edu->pdev->dev, "ioctl cmd=0x%x, arg=0x%lx\n", cmd, arg);
 
     if(_IOC_TYPE(cmd) != EDU_IOCTL_MAGIC)
         return -ENOTTY;
