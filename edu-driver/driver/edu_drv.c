@@ -1,11 +1,16 @@
-//SPDX-Licence-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0
 #include "edu_uapi.h"
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/pci_regs.h>
+
 #include <linux/cdev.h>
+#include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/pci.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 
 #define EDU_VENDOR_ID 0x1234
@@ -27,6 +32,12 @@
 #define EDU_REG_DMA_COUNT           0x90
 #define EDU_REG_DMA_COMMAND         0x98
 
+#define EDU_STATUS_IRQFACT          0x00000080
+#define EDU_IRQ_FACTORIAL           0x00000001
+#define EDU_STATUS_COMPUTING        0x00000001
+#define EDU_MAX_FACTORIAL_INPUT     12
+#define EDU_MAX_TIMEOUT_MS          10000
+
 struct edu_device {
     /* PCI */
     struct pci_dev *pdev;
@@ -42,24 +53,46 @@ struct edu_device {
 
     /* Synchronization */
     struct mutex ioctl_lock;
+
+    /* IRQ */
+    int irq;
+    struct completion completion;
+    spinlock_t irq_lock;
+    u32 irq_status;
 };
 
 static struct class *edu_class;
 
-static int edu_open(struct inode *inode, struct file *file) {
+static int edu_open(struct inode *inode, struct file *file)
+{
     struct edu_device *edu;
 
     edu = container_of(inode->i_cdev, struct edu_device, cdev);
 
     file->private_data = edu;
-    // dev_info(&edu->pdev->dev, "open: edu-gpu0\n");
     return 0;
 }
 
-static int edu_release(struct inode *inode, struct file *file){
-    // struct edu_device *edu = file->private_data;
-    // dev_info(&edu->pdev->dev, "release: edu-gpu0\n");
+static int edu_release(struct inode *inode, struct file *file)
+{
     return 0;
+}
+
+static void edu_quiesce_irqs(struct edu_device *edu)
+{
+    unsigned long flags;
+    u32 status;
+
+    writel(0, edu->bar0 + EDU_REG_STATUS);
+    synchronize_irq(edu->irq);
+
+    status = readl(edu->bar0 + EDU_REG_IRQ_STATUS);
+    if (status)
+        writel(status, edu->bar0 + EDU_REG_IRQ_ACK);
+
+    spin_lock_irqsave(&edu->irq_lock, flags);
+    edu->irq_status = 0;
+    spin_unlock_irqrestore(&edu->irq_lock, flags);
 }
 
 static long edu_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
@@ -75,7 +108,7 @@ static long edu_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
     mutex_lock(&edu->ioctl_lock);
 
     switch(cmd) {
-        case EDU_IOCTL_REG_READ:
+        case EDU_IOCTL_REG_READ: {
             if(copy_from_user(&reg, (void __user *)arg, sizeof(reg))){
                 ret = -EFAULT;
                 break;
@@ -91,8 +124,8 @@ static long edu_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
             if(copy_to_user((void __user*)arg, &reg, sizeof(reg)))
                 ret = -EFAULT;
             break;
-
-        case EDU_IOCTL_REG_WRITE:
+        }
+        case EDU_IOCTL_REG_WRITE:{
             if(copy_from_user(&reg, (void __user *)arg, sizeof(reg))) {
                 ret = -EFAULT;
                 break;
@@ -104,10 +137,77 @@ static long edu_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
             }
 
             writel(reg.value, edu->bar0 + reg.offset);
-
             break;
-        
-            
+        }
+        case EDU_IOCTL_FACTORIAL:{
+            struct edu_factorial factorial;
+            unsigned long flags;
+            long wait_ret;
+            u32 irq_status;
+            u32 compute_status;
+
+            if(copy_from_user(&factorial, (void __user *)arg, sizeof(factorial))) {
+                ret = -EFAULT;
+                break;
+            }
+
+            if (factorial.input > EDU_MAX_FACTORIAL_INPUT) {
+                ret = -ERANGE;
+                break;
+            }
+
+            if (!factorial.timeout_ms ||
+                factorial.timeout_ms > EDU_MAX_TIMEOUT_MS) {
+                ret = -EINVAL;
+                break;
+            }
+
+            compute_status = readl(edu->bar0 + EDU_REG_STATUS);
+            if (compute_status & EDU_STATUS_COMPUTING) {
+                ret = -EBUSY;
+                break;
+            }
+
+            edu_quiesce_irqs(edu);
+            reinit_completion(&edu->completion);
+
+            writel(EDU_STATUS_IRQFACT, edu->bar0 + EDU_REG_STATUS);
+            writel(factorial.input, edu->bar0 + EDU_REG_FACTORIAL);
+
+            wait_ret = wait_for_completion_interruptible_timeout(
+                &edu->completion,
+                msecs_to_jiffies(factorial.timeout_ms));
+            if (wait_ret == 0) {
+                edu_quiesce_irqs(edu);
+                ret = -ETIMEDOUT;
+                break;
+            }
+            if (wait_ret < 0) {
+                edu_quiesce_irqs(edu);
+                ret = wait_ret;
+                break;
+            }
+
+            spin_lock_irqsave(&edu->irq_lock, flags);
+            irq_status = edu->irq_status;
+            edu->irq_status &= ~EDU_IRQ_FACTORIAL;
+            spin_unlock_irqrestore(&edu->irq_lock, flags);
+
+            writel(0, edu->bar0 + EDU_REG_STATUS);
+
+            if (!(irq_status & EDU_IRQ_FACTORIAL)) {
+                ret = -EIO;
+                break;
+            }
+
+            factorial.result = readl(edu->bar0 + EDU_REG_FACTORIAL);
+            if(copy_to_user((void __user *)arg, &factorial, sizeof(factorial))) {
+                ret = -EFAULT;
+                break;
+            }
+            ret = 0;
+            break;
+        }
         default:
             ret = -ENOTTY;
             break;
@@ -180,6 +280,28 @@ static void edu_write32(struct edu_device *edu, u32 offset, u32 value) {
 }
 #endif
 
+static irqreturn_t edu_irq_handler(int irq, void *data)
+{
+    struct edu_device *edu = data;
+    u32 status;
+    unsigned long flags;
+
+    status = readl(edu->bar0 + EDU_REG_IRQ_STATUS);
+    if (!status)
+        return IRQ_NONE;
+
+    writel(status, edu->bar0 + EDU_REG_IRQ_ACK);
+
+    spin_lock_irqsave(&edu->irq_lock, flags);
+    edu->irq_status |= status;
+    spin_unlock_irqrestore(&edu->irq_lock, flags);
+
+    if (status & EDU_IRQ_FACTORIAL)
+        complete(&edu->completion);
+
+    return IRQ_HANDLED;
+}
+
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     struct edu_device *edu;
     int ret;
@@ -192,6 +314,9 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 
     edu->pdev = pdev;
     pci_set_drvdata(pdev, edu);
+    init_completion(&edu->completion);
+    spin_lock_init(&edu->irq_lock);
+    mutex_init(&edu->ioctl_lock);
 
     ret = pci_enable_device(pdev);
     if(ret) {
@@ -199,15 +324,24 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
         return ret;
     }
 
+    pci_set_master(pdev);
+
     ret = pci_request_regions(pdev, "edu_drv");
     if(ret) {
         dev_err(&pdev->dev, "pci_request_regions failed: %d\n", ret);
-        goto err_disable_device;
+        goto err_clear_master;
     }
 
     edu->bar0_len = pci_resource_len(pdev, 0);
     edu->bar0_start = pci_resource_start(pdev, 0);
     edu->bar0_flags = pci_resource_flags(pdev, 0);
+
+    if (!(edu->bar0_flags & IORESOURCE_MEM) ||
+        edu->bar0_len < EDU_REG_IRQ_ACK + sizeof(u32)) {
+        dev_err(&pdev->dev, "BAR0 is not a valid EDU MMIO region\n");
+        ret = -ENODEV;
+        goto err_release_region;
+    }
 
     dev_info(&pdev->dev, "BAR0 start=%pa, len=%pa, flags=%lx\n", &edu->bar0_start, &edu->bar0_len, edu->bar0_flags);
 
@@ -216,11 +350,6 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
         ret = -ENOMEM;
         goto err_release_region;
     }
-
-    ret = edu_chrdev_register(edu);
-    if(ret)
-        return ret;
-
 #ifdef MMIO_TEST
     u32 edu_id;
     u32 liveness;
@@ -232,24 +361,53 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     liveness = edu_read32(edu, EDU_REG_LIVENESS);
     printk("BAR0 liveness: 0x%x\n", liveness);
 #endif
+    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+    if(ret < 0) {
+        dev_err(&pdev->dev, "pci_alloc_irq_vectors failed: %d\n", ret);
+        goto err_iounmap;
+    }
+
+    edu->irq = pci_irq_vector(pdev, 0);
+
+    ret = request_irq(edu->irq, edu_irq_handler, 0, "edu_drv", edu);
+    if(ret) {
+        dev_err(&pdev->dev, "request_irq failed: %d\n", ret);
+        goto err_free_vectors;
+    }
+
+    ret = edu_chrdev_register(edu);
+    if(ret)
+        goto err_free_irq;
 
     return 0;
+
+err_free_irq:
+    free_irq(edu->irq, edu);
+err_free_vectors:
+    pci_free_irq_vectors(pdev);
+err_iounmap:
+    pci_iounmap(pdev, edu->bar0);
 err_release_region:
     pci_release_regions(pdev);
-err_disable_device:
+err_clear_master:
+    pci_clear_master(pdev);
     pci_disable_device(pdev);
     return ret;
 }
 
-static void edu_remove(struct pci_dev *pdev) {
-    dev_info(&pdev->dev, "remove: edu\n");
-    
+static void edu_remove(struct pci_dev *pdev)
+{
     struct edu_device *edu = pci_get_drvdata(pdev);
-    if(edu->bar0) {
-        pci_iounmap(pdev, edu->bar0);
-    }
+
+    dev_info(&pdev->dev, "remove: edu\n");
+
     edu_chrdev_unregister(edu);
+    edu_quiesce_irqs(edu);
+    free_irq(edu->irq, edu);
+    pci_free_irq_vectors(pdev);
+    pci_iounmap(pdev, edu->bar0);
     pci_release_regions(pdev);
+    pci_clear_master(pdev);
     pci_disable_device(pdev);
 }
 
@@ -292,4 +450,4 @@ module_exit(edu_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Yang xinzhe");
-MODULE_DESCRIPTION("QEME EDU PCI training driver");
+MODULE_DESCRIPTION("QEMU EDU PCI training driver");

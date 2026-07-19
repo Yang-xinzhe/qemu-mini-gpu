@@ -23,12 +23,13 @@ Linux PCI 驱动 edu_drv.ko
 - 使用 mutex 串行化 ioctl 操作；
 - 提供 Buildroot 用户态测试程序；
 - 验证 identification、liveness 和非法 ioctl 路径；
-- 提供共享 fd 和并发 open/close 两种多线程压力测试。
+- 提供共享 fd 和并发 open/close 两种多线程压力测试；
+- 使用 MSI 和 completion 实现异步阶乘 ioctl；
+- 验证 `5! = 120` 的 IRQ 唤醒和用户态返回链路；
+- 完成 probe 失败回滚以及 remove 时的 IRQ、MSI、BAR0 和 PCI 资源释放。
 
 尚未完成：
 
-- `EDU_IOCTL_FACTORIAL` 的驱动实现；
-- 中断处理；
 - DMA 数据传输；
 - 自动化加载驱动和执行测试。
 
@@ -151,6 +152,24 @@ ls -l /dev/edu_gpu0
 [PASS] test completed
 ```
 
+### 阶乘和 MSI 中断测试
+
+阶乘 ioctl 会使能 EDU 的 factorial IRQ、启动计算，并通过 completion 让调用进程睡眠等待。QEMU 完成计算后发送 MSI，IRQ handler 读取并 ACK 中断，随后唤醒 ioctl 返回结果。
+
+```sh
+/root/edu_usertest factorial 5
+```
+
+成功输出：
+
+```text
+[TEST] ioctl FACTORIAL input=5 timeout=1000 ms
+[PASS] 5! = 120
+[PASS] test completed
+```
+
+输入范围为 0 到 12，因为 `13!` 已经超过 32 位无符号整数。驱动接受的等待时间范围为 1 到 10000 毫秒；设备仍在计算时，新请求返回 `EBUSY`。
+
 ### 多线程压力测试
 
 多个线程共享同一个 fd，并发读取 identification 寄存器，同时定期检查非法 ioctl 是否稳定返回 `ENOTTY`：
@@ -194,6 +213,7 @@ rmmod edu_drv
 edu_usertest open [device]
 edu_usertest read <offset> [device]
 edu_usertest write <offset> <value> [device]
+edu_usertest factorial <input> [device]
 edu_usertest invalid [device]
 edu_usertest all <offset> <value> [device]
 edu_usertest stress <threads> <iterations> [device]
@@ -206,6 +226,7 @@ edu_usertest open-stress <threads> <iterations> [device]
 /root/edu_usertest open
 /root/edu_usertest read 0x00
 /root/edu_usertest write 0x04 0x12345678
+/root/edu_usertest factorial 5
 /root/edu_usertest invalid
 /root/edu_usertest all 0x04 0x12345678
 /root/edu_usertest stress 8 10000
@@ -222,9 +243,9 @@ edu_usertest open-stress <threads> <iterations> [device]
 | --- | --- | --- | --- |
 | `EDU_IOCTL_REG_READ` | 内核读 BAR0，结果返回用户态 | `struct edu_reg_io` | 已实现 |
 | `EDU_IOCTL_REG_WRITE` | 用户态写 BAR0 | `struct edu_reg_io` | 已实现 |
-| `EDU_IOCTL_FACTORIAL` | 提交阶乘输入并获取结果 | `struct edu_factorial` | 仅定义，尚未实现 |
+| `EDU_IOCTL_FACTORIAL` | 提交阶乘输入并等待 IRQ 返回结果 | `struct edu_factorial` | 已实现 |
 
-驱动遇到未知 ioctl 或尚未实现的 ioctl 时返回 `ENOTTY`。
+驱动遇到未知 ioctl 时返回 `ENOTTY`。
 
 ## 已验证的寄存器
 
@@ -232,11 +253,49 @@ edu_usertest open-stress <threads> <iterations> [device]
 | --- | --- | --- |
 | `0x00` | Identification | 只读，预期值为 `0x010000ed` |
 | `0x04` | Liveness | 写入一个 32 位值，读回其按位取反结果 |
-| `0x08` | Factorial | 写入会触发阶乘计算，目前还没有对应的高级 ioctl 流程 |
+| `0x08` | Factorial | 写入触发阶乘计算，通过 `EDU_IOCTL_FACTORIAL` 等待完成 |
+| `0x20` | Status | bit 0 表示正在计算，bit 7 使能 factorial IRQ |
+| `0x24` | IRQ status | bit 0 表示 factorial 完成中断 |
+| `0x64` | IRQ acknowledge | 写入对应状态位清除 pending IRQ |
 
 不要把所有寄存器都当作普通内存进行“写入后原值读回”。EDU 的不同寄存器具有不同语义，部分寄存器还会触发中断或 DMA 等副作用。
 
 压力测试选择只读的 identification 寄存器作为并发一致性检查。`0x04` liveness 的一次写入和随后一次读取是两个独立 ioctl，其他线程可以在两者之间写入新值，因此不能用它判断每个线程是否读回了自己的写入结果。
+
+## 本阶段问题与修复记录
+
+### factorial 一直返回 `ETIMEDOUT`
+
+现象是阶乘寄存器已经得到 `5! = 120`，`0x20` 的 IRQFACT 位也已经使能，但 `/proc/interrupts` 中 `edu_drv` 的 MSI 计数始终为 0。
+
+根因是 probe 只调用了 `pci_enable_device()`，没有调用 `pci_set_master()`。MSI 消息没有正常投递到 CPU，因此 IRQ handler 没有进入，completion 也无法唤醒 ioctl。现在驱动会在启用 PCI 设备后调用 `pci_set_master()`，并在失败回滚和 remove 时调用 `pci_clear_master()`。
+
+### 用户态始终打印 factorial 结果为 0
+
+最初测试程序把结构体初始化时使用的局部变量 `result` 打印出来，而 ioctl 真正写回的是 `factorial.result`；同时没有检查 ioctl 返回值，所以 timeout 也会被掩盖。现在测试程序检查 ioctl 错误、读取 `factorial.result`，并自行计算预期结果进行比较。
+
+### probe 失败时资源没有完整回滚
+
+字符设备注册失败后曾经直接返回，导致 IRQ handler、MSI vector、BAR0 映射和 PCI 资源泄漏；错误路径还曾将 BAR 编号 `0` 错当成 `pci_iounmap()` 的映射地址。现在字符设备最后发布，所有失败标签按照资源申请的相反顺序执行：
+
+```text
+free_irq
+→ pci_free_irq_vectors
+→ pci_iounmap
+→ pci_release_regions
+→ pci_clear_master
+→ pci_disable_device
+```
+
+### remove 中先解除 BAR0 映射
+
+旧逻辑在 `free_irq()` 之前解除 BAR0 映射，handler 或后续的 `readl()`/`writel()` 可能访问已经失效的 MMIO 地址。现在 remove 会先注销字符设备、关闭并 ACK 设备中断，再释放 IRQ 和 MSI vector，最后才解除 BAR0 映射并关闭 PCI 设备。
+
+### timeout 后的迟到 IRQ
+
+等待超时不等于硬件任务已取消。旧任务完成后产生的迟到 IRQ 可能污染下一次请求。当前驱动在启动任务前清理旧 IRQ/completion 状态，在 timeout 或信号中断时关闭 factorial IRQ、同步 handler、ACK pending 状态，并在新任务开始前检查 `EDU_STATUS_COMPUTING`。
+
+当前驱动面向固定的 QEMU EDU 教学设备和正常模块加载/卸载流程，尚未实现 PCI 热拔插期间仍有用户 fd 打开的完整生命周期管理。
 
 ## 串口日志交错
 

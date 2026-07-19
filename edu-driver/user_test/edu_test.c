@@ -36,6 +36,7 @@ static void print_usage(const char *program)
             "  %s open [device]\n"
             "  %s read <offset> [device]\n"
             "  %s write <offset> <value> [device]\n"
+            "  %s factorial <input> [device]\n"
             "  %s invalid [device]\n"
             "  %s all <offset> <value> [device]\n"
             "  %s stress <threads> <iterations> [device]\n"
@@ -45,12 +46,15 @@ static void print_usage(const char *program)
             "  %s open\n"
             "  %s read 0x00\n"
             "  %s write 0x04 0x12345678\n"
+            "  %s factorial 5\n"
             "  %s invalid\n"
             "  %s all 0x04 0x12345678\n"
             "  %s stress 8 10000\n"
             "  %s open-stress 8 1000\n",
             program, program, program, program, program, program, program,
-            program, program, program, program, program, program, program);
+            program,
+            program, program, program, program, program, program, program,
+            program);
 }
 
 static int open_device(const char *device)
@@ -70,8 +74,6 @@ static int open_device(const char *device)
 
 static int close_device(int fd)
 {
-    // printf("[TEST] closing fd=%d\n", fd);
-
     if (close(fd) < 0) {
         fprintf(stderr,
                 "[FAIL] close: %s\n",
@@ -79,7 +81,6 @@ static int close_device(int fd)
         return -1;
     }
 
-    // printf("[PASS] close succeeded\n");
     return 0;
 }
 
@@ -129,6 +130,51 @@ static int test_reg_write(int fd, uint32_t offset, uint32_t value)
     }
 
     printf("[PASS] write ioctl succeeded\n");
+    return 0;
+}
+
+static int test_factorial(int fd, uint32_t input)
+{
+    struct edu_factorial factorial = {
+        .input = input,
+        .result = 0,
+        .timeout_ms = 1000,
+    };
+    uint32_t expected = 1;
+    uint32_t i;
+
+    if (input > 12) {
+        fprintf(stderr,
+                "[FAIL] factorial input must be between 0 and 12\n");
+        return -1;
+    }
+
+    printf("[TEST] ioctl FACTORIAL input=%u timeout=%u ms\n",
+            factorial.input,
+            factorial.timeout_ms);
+
+    if (ioctl(fd, EDU_IOCTL_FACTORIAL, &factorial) < 0) {
+        fprintf(stderr,
+                "[FAIL] EDU_IOCTL_FACTORIAL: %s (errno=%d)\n",
+                strerror(errno),
+                errno);
+        return -1;
+    }
+
+    for (i = 2; i <= input; i++)
+        expected *= i;
+
+    if (factorial.result != expected) {
+        fprintf(stderr,
+                "[FAIL] %u!: expected %u, got %u\n",
+                factorial.input, expected, factorial.result);
+        return -1;
+    }
+
+    printf("[PASS] %u! = %u\n",
+            factorial.input,
+            factorial.result);
+
     return 0;
 }
 
@@ -411,7 +457,7 @@ int main(int argc, const char **argv)
         }
         if (argc == 3)
             device = argv[2];
-    } else if (strcmp(command, "read") == 0) {
+    } else if (strcmp(command, "read") == 0 || strcmp(command, "factorial") == 0) {
         if (argc < 3 || argc > 4 || parse_u32(argv[2], &offset) < 0) {
             print_usage(argv[0]);
             return EXIT_FAILURE;
@@ -459,6 +505,8 @@ int main(int argc, const char **argv)
         status = test_reg_read(fd, offset, NULL);
     else if (strcmp(command, "write") == 0)
         status = test_reg_write(fd, offset, value);
+    else if (strcmp(command, "factorial") == 0)
+        status = test_factorial(fd, offset);
     else if (strcmp(command, "invalid") == 0)
         status = test_invalid_ioctl(fd);
     else if (strcmp(command, "all") == 0) {
