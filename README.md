@@ -43,20 +43,37 @@ sudo apt install -y \
 
 ## 2. 获取源码
 
-新 clone 仓库时，推荐同时拉取所有 submodule：
+先 clone 父仓库，再只初始化本项目直接依赖的三个顶层 submodule：
 
 ```sh
-git clone --recurse-submodules https://github.com/Yang-xinzhe/qemu-mini-gpu.git
+git clone https://github.com/Yang-xinzhe/qemu-mini-gpu.git
 cd qemu-mini-gpu
+
+git submodule sync
+git submodule update --init --depth 1 --jobs 1 \
+    qemu/src \
+    linux/src \
+    buildroot/src
 ```
 
-如果已经 clone，但 `qemu/src`、`linux/src` 或 `buildroot/src` 是空目录，运行：
+`--depth 1` 只获取父仓库固定的源码版本，避免下载完整的上游历史；`--jobs 1` 依次下载三个大型仓库，便于在网络不稳定时定位失败项。网络稳定时可以把它改为 `--jobs 3`。
+
+不要在默认安装流程中使用 `--recurse-submodules` 或 `git submodule update --recursive`。QEMU 自身还登记了多个 ROM、固件和测试工具 submodule，递归初始化会继续下载这些本实验不需要的仓库，显著增加下载时间和失败概率。
+
+如果已经 clone，但 `qemu/src`、`linux/src` 或 `buildroot/src` 是空目录，仍然运行上面的 `git submodule sync` 和 `git submodule update` 命令即可，不需要重新 clone 父仓库。
+
+更新父仓库后，运行：
 
 ```sh
-git submodule update --init --recursive
+git pull --ff-only
+git submodule sync
+git submodule update --init --depth 1 \
+    qemu/src \
+    linux/src \
+    buildroot/src
 ```
 
-更新父仓库后，也建议再次执行该命令，确保 submodule 切换到父仓库记录的版本。
+这样会把三个 submodule 切换到新父仓库提交所记录的精确版本。submodule 处于 detached HEAD 是正常现象。
 
 ## 3. 构建
 
@@ -171,7 +188,25 @@ make -C buildroot/src \
 ### `qemu/src`、`linux/src` 或 `buildroot/src` 中没有源码
 
 ```sh
-git submodule update --init --recursive
+git submodule sync
+git submodule update --init --depth 1 --jobs 1 \
+    qemu/src \
+    linux/src \
+    buildroot/src
+```
+
+如果下载中断，可以重复运行该命令，Git 会继续补齐尚未完成的 submodule。也可以逐个执行以确定失败的远端：
+
+```sh
+git submodule update --init --depth 1 qemu/src
+git submodule update --init --depth 1 linux/src
+git submodule update --init --depth 1 buildroot/src
+```
+
+Linux 源码仓库体积较大，检出过程可能需要较长时间。只有在明确需要构建 QEMU 自带的 ROM 或固件时，才额外初始化 QEMU 的嵌套 submodule：
+
+```sh
+git -C qemu/src submodule update --init --recursive
 ```
 
 ### 启动时提示找不到 QEMU、内核或 rootfs
