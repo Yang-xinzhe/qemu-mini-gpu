@@ -15,3 +15,6 @@ rootfs/
 # Runtime logs
 logs/*
 !logs/README.md
+
+# clangd compilation databases
+edu-driver/compile_commands.json

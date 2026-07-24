@@ -13,6 +13,9 @@ BUILDROOT := $(PROJECT_ROOT)/buildroot
 RUN_QEMU := $(PROJECT_ROOT)/scripts/run-edu.sh
 TARGET_CC := $(BUILDROOT)/build/host/bin/x86_64-buildroot-linux-gnu-gcc
 USER_TEST := user_test/edu_usertest
+PYTHON3 ?= python3
+COMPILE_COMMANDS_GEN := scripts/gen_compile_commands.py
+KERNEL_COMPILE_COMMANDS_GEN := $(PROJECT_ROOT)/linux/src/scripts/clang-tools/gen_compile_commands.py
 
 .PHONY: all module user_test install run clean
 
@@ -20,6 +23,13 @@ all: module user_test
 
 module:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+compile_commands.json: module $(COMPILE_COMMANDS_GEN)
+	$(PYTHON3) $(COMPILE_COMMANDS_GEN) \
+		--kernel-generator $(KERNEL_COMPILE_COMMANDS_GEN) \
+		--module-dir $(CURDIR) \
+		--target-cc $(TARGET_CC) \
+		--output $@
 
 user_test: $(USER_TEST)
 
